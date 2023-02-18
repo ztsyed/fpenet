@@ -86,6 +86,65 @@ def draw_bounding_boxes(image, obj_meta, confidence):
                         (0, 0, 255, 0), 2)
     return image
 
+def sgie_src_pad_buffer_probe(pad,info,u_data):
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        print("Unable to get GstBuffer ")
+        return
+    
+    # Retrieve batch metadata from the gst_buffer
+    # Note that pyds.gst_buffer_get_nvds_batch_meta() expects the
+    # C address of gst_buffer as input, which is obtained with hash(gst_buffer)
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            # Note that l_frame.data needs a cast to pyds.NvDsFrameMeta
+            # The casting is done by pyds.NvDsFrameMeta.cast()
+            # The casting also keeps ownership of the underlying memory
+            # in the C code, so the Python garbage collector will leave
+            # it alone.
+           frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+           print("SGIE Frame_Meta",frame_meta.frame_num)
+        except StopIteration:
+            break
+
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                continue
+
+            l_user = obj_meta.obj_user_meta_list
+
+            # Retrieve TensorMeta data from FaceNet
+            # Face recognition is this example is carried out with a simple L2 distance between the embedding from FaceNet
+            # with a list of pre-saved embeddings corresponding to the face ids (one in this case)
+            if l_user is not None:
+                user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+                tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+                #print("Tensor_meta",user_meta.base_meta.meta_type)
+                idx = 0 
+                for layer in range(tensor_meta.num_output_layers):
+                    print("Layer",idx, tensor_meta.output_layers_info(layer).layerName)
+                    if tensor_meta.output_layers_info(layer).layerName == "softargmax":
+                        coord= tensor_meta.out_buf_ptrs_host
+                        print("Landmark Coordinates",coord[0] )
+                    if tensor_meta.output_layers_info(layer).layerName == "softargmax:1":
+                        conf= tensor_meta.out_buf_ptrs_host
+                        print("Landmark Confidence", conf[0] )
+                    idx= idx+1
+
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+    return Gst.PadProbeReturn.OK
 
 def osd_sink_pad_buffer_probe(pad,info,u_data):
     face_thres = 1.0 
@@ -120,7 +179,7 @@ def osd_sink_pad_buffer_probe(pad,info,u_data):
            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
         except StopIteration:
             break
-
+        print("OSD Frame_Meta",frame_meta.frame_num)
         l_obj=frame_meta.obj_meta_list
         save_image = False
         while l_obj is not None:
@@ -145,10 +204,13 @@ def osd_sink_pad_buffer_probe(pad,info,u_data):
             if l_user is not None:
                 user_meta = pyds.NvDsUserMeta.cast(l_user.data)
                 tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+                print("Tensor_meta",user_meta.base_meta.meta_type)
+                
                 layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+                print("Tensor_meta Layer Name",layer.layerName)
                 ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
                 v = np.ctypeslib.as_array(ptr, shape=(1,128))
-                print("prior",v)
+                #print("prior",v)
 
                 # Getting Image data using nvbufsurface
                 # the input should be address of buffer and batch_id
@@ -166,12 +228,12 @@ def osd_sink_pad_buffer_probe(pad,info,u_data):
                 
 
                 # L2 normalization
-                #v = v/np.linalg.norm(v)
-                print("normalized ",v)
+                v = v/np.linalg.norm(v)
+                #print("normalized ",v)
                 for i, emb in enumerate(emb_array):
                     #emb = emb/np.linalg.norm(emb)
                     dist = np.linalg.norm(v - emb)
-                    print("Checking distance",dist, np.linalg.norm(v), np.linalg.norm(emb))
+                    #print("Checking distance",dist)
                     if dist < face_thres:
                         id_name_dic[str(obj_meta.object_id)]= names[i]
                         break
@@ -253,6 +315,10 @@ def main(args):
     if not sgie1:
         sys.stderr.write(" Unable to make sgie1 \n")
         
+    queue1 = Gst.ElementFactory.make("queue", "queue1")
+    if not queue1:
+        sys.stderr.write(" Unable to create queue1 \n")
+
     # Use convertor to convert from NV12 to RGBA as required by nvosd
     nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
     if not nvvidconv:
@@ -380,6 +446,7 @@ def main(args):
     pipeline.add(pgie)
     pipeline.add(tracker)
     pipeline.add(sgie1)
+    pipeline.add(queue1)
     pipeline.add(nvvidconv)
     pipeline.add(nvosd)
     pipeline.add(nvvidconv_postosd)
@@ -408,7 +475,8 @@ def main(args):
     streammux.link(pgie)
     pgie.link(tracker)
     tracker.link(sgie1)
-    sgie1.link(nvvidconv)
+    sgie1.link(queue1)
+    queue1.link(nvvidconv)
     nvvidconv.link(nvosd)
     nvosd.link(nvvidconv_postosd)
     nvvidconv_postosd.link(caps)
@@ -447,6 +515,11 @@ def main(args):
 
     osdsinkpad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, 0)
 
+    sgiesinkpad = queue1.get_static_pad("src")
+    if not osdsinkpad:
+        sys.stderr.write(" Unable to get sink pad of nvosd \n")
+
+    sgiesinkpad.add_probe(Gst.PadProbeType.BUFFER, sgie_src_pad_buffer_probe, 0)
     # start play back and listen to events
     print("Starting pipeline \n")
     pipeline.set_state(Gst.State.PLAYING)
