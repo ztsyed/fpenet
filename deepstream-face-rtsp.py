@@ -124,17 +124,19 @@ def sgie_src_pad_buffer_probe(pad,info,u_data):
             if l_user is not None:
                 user_meta = pyds.NvDsUserMeta.cast(l_user.data)
                 tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
-                #print("Tensor_meta",user_meta.base_meta.meta_type)
-                idx = 0 
-                for layer in range(tensor_meta.num_output_layers):
-                    print("Layer",idx, tensor_meta.output_layers_info(layer).layerName)
-                    if tensor_meta.output_layers_info(layer).layerName == "softargmax":
-                        coord= tensor_meta.out_buf_ptrs_host
-                        print("Landmark Coordinates",coord[0] )
-                    if tensor_meta.output_layers_info(layer).layerName == "softargmax:1":
-                        conf= tensor_meta.out_buf_ptrs_host
-                        print("Landmark Confidence", conf[0] )
-                    idx= idx+1
+                print("SGIE Tensor_meta Layer Count",tensor_meta.num_output_layers)
+                frame_outputs = []
+                for layerIdx in range(tensor_meta.num_output_layers):
+                    print("SGIE LayerName",layerIdx, tensor_meta.output_layers_info(layerIdx).layerName)
+                    if tensor_meta.output_layers_info(layerIdx).layerName == "softargmax":
+                        ptr = ctypes.cast(pyds.get_ptr(tensor_meta.output_layers_info(layerIdx).buffer), ctypes.POINTER(ctypes.c_float))
+                        v = np.ctypeslib.as_array(ptr, shape=(80,2))
+                        frame_outputs.append(v)
+                        print("SGIE Layer done")
+                    # if tensor_meta.output_layers_info(layer).layerName == "softargmax:1":
+                    #     conf= tensor_meta.out_buf_ptrs_host
+                    #     print("Landmark Confidence", conf[0] )
+                    # idx= idx+1
 
             try:
                 l_obj = l_obj.next
@@ -210,6 +212,21 @@ def osd_sink_pad_buffer_probe(pad,info,u_data):
                 print("Tensor_meta Layer Name",layer.layerName)
                 ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
                 v = np.ctypeslib.as_array(ptr, shape=(1,128))
+                print("Tensor_meta Layer Count",tensor_meta.num_output_layers)
+                frame_outputs = []
+                for layerIdx in range(tensor_meta.num_output_layers):
+                    print("OSD LayerName",layerIdx, tensor_meta.output_layers_info(layerIdx).layerName)
+                    if tensor_meta.output_layers_info(layerIdx).layerName == "softargmax":
+                        ptr = ctypes.cast(pyds.get_ptr(tensor_meta.output_layers_info(layerIdx).buffer), ctypes.POINTER(ctypes.c_float))
+                        v = np.ctypeslib.as_array(ptr, shape=(80,2))
+                        #np.savetxt("coords.txt",v)
+                        frame_outputs.append(v)
+                        print("OSD softargmax Layer done", v)
+                    if tensor_meta.output_layers_info(layerIdx).layerName == "softargmax:1":
+                        ptr = ctypes.cast(pyds.get_ptr(tensor_meta.output_layers_info(layerIdx).buffer), ctypes.POINTER(ctypes.c_float))
+                        v = np.ctypeslib.as_array(ptr, shape=(80,))
+                        frame_outputs.append(v)
+                        print("OSD Layer done ",v)
                 #print("prior",v)
 
                 # Getting Image data using nvbufsurface
@@ -232,7 +249,7 @@ def osd_sink_pad_buffer_probe(pad,info,u_data):
                 #print("normalized ",v)
                 for i, emb in enumerate(emb_array):
                     #emb = emb/np.linalg.norm(emb)
-                    dist = np.linalg.norm(v - emb)
+                    dist = 0 #np.linalg.norm(v - emb)
                     #print("Checking distance",dist)
                     if dist < face_thres:
                         id_name_dic[str(obj_meta.object_id)]= names[i]
@@ -519,7 +536,7 @@ def main(args):
     if not osdsinkpad:
         sys.stderr.write(" Unable to get sink pad of nvosd \n")
 
-    sgiesinkpad.add_probe(Gst.PadProbeType.BUFFER, sgie_src_pad_buffer_probe, 0)
+    #sgiesinkpad.add_probe(Gst.PadProbeType.BUFFER, sgie_src_pad_buffer_probe, 0)
     # start play back and listen to events
     print("Starting pipeline \n")
     pipeline.set_state(Gst.State.PLAYING)
